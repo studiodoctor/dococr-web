@@ -30,6 +30,7 @@ import fitz  # PyMuPDF
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -156,6 +157,7 @@ class PageOut(BaseModel):
     diagnostics: list[str]
     boxes: list[BoxOut]
     image: str
+    table: list[list[str]]
 
 
 class JobStatus(BaseModel):
@@ -234,6 +236,7 @@ def _run_job(job: _Job, filename: str, data: bytes) -> None:
                     for t, c, b in result.boxes
                 ],
                 image=_encode_png(rgb),
+                table=result.table,
             )
             with job.lock:
                 job.pages.append(page_out)
@@ -298,6 +301,84 @@ def scan_status(job_id: str):
     if job is None:
         raise HTTPException(404, "Unknown or expired job.")
     return job.to_status()
+
+
+def _get_finished_job(job_id: str) -> "_Job":
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired job.")
+    if job.status != "done":
+        raise HTTPException(409, "The scan isn't finished yet.")
+    return job
+
+
+def _download_stem(filename: str) -> str:
+    return Path(filename or "scan").stem or "scan"
+
+
+@app.get("/api/scan/{job_id}/csv")
+def scan_csv(job_id: str):
+    """Downloads every page's reconstructed table as one CSV file, with a
+    'Page N' marker row between pages when there's more than one."""
+    job = _get_finished_job(job_id)
+    status = job.to_status()
+    lines: list[str] = []
+    multi_page = len(status.pages) > 1
+    for page in status.pages:
+        if multi_page:
+            if lines:
+                lines.append("")
+            lines.append(f"Page {page.index + 1}")
+        if page.table:
+            lines.append(ocr_engine.table_to_csv(page.table).rstrip("\r\n"))
+        else:
+            lines.append(page.text.replace(",", " "))
+    csv_bytes = ("\n".join(lines) + "\n").encode("utf-8-sig")
+    stem = _download_stem(status.filename)
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.csv"'},
+    )
+
+
+@app.get("/api/scan/{job_id}/xlsx")
+def scan_xlsx(job_id: str):
+    """Downloads every page's reconstructed table as one Excel workbook, one
+    sheet per page."""
+    job = _get_finished_job(job_id)
+    status = job.to_status()
+
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for page in status.pages:
+        title = f"Page {page.index + 1}"[:31] or "Sheet"
+        ws = wb.create_sheet(title=title)
+        rows = page.table or [[line] for line in page.text.splitlines()]
+        widths: dict[int, int] = {}
+        for r, row in enumerate(rows, start=1):
+            for c, value in enumerate(row, start=1):
+                ws.cell(row=r, column=c, value=value)
+                widths[c] = max(widths.get(c, 8), min(60, len(str(value)) + 2))
+        for c, w in widths.items():
+            ws.column_dimensions[get_column_letter(c)].width = w
+        ws.freeze_panes = "A2"
+    if not wb.sheetnames:
+        wb.create_sheet(title="Sheet1")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    stem = _download_stem(status.filename)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.xlsx"'},
+    )
 
 
 # Serve the frontend as static files, with index.html at the root.

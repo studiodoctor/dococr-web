@@ -651,6 +651,85 @@ def to_plain_text(regions):
 
 
 # ---------------------------------------------------------------------------
+# Table reconstruction (for CSV/Excel export) — groups the fused word boxes
+# into rows (via the same group_lines() used for reading order) and then into
+# columns, by clustering cell x-centers across the whole page. This is a
+# heuristic (there's no ground-truth table structure from OCR alone) but
+# works well for the tabular statements/invoices this app targets: dates,
+# descriptions, and amounts land in consistent columns because the source
+# document itself is columnar.
+# ---------------------------------------------------------------------------
+
+def build_table(boxes) -> list[list[str]]:
+    """Returns a rectangular grid (list of rows, each a list of cell strings)
+    reconstructed from fused OCR boxes. Empty list if there's no text."""
+    if not boxes:
+        return []
+
+    lines = group_lines(boxes)
+    heights = [b[2][3] - b[2][1] for ln in lines for b in ln]
+    median_h = statistics.median(heights) if heights else 10.0
+    # A gap between adjacent words wider than this is treated as a column
+    # boundary rather than just word-spacing within one cell.
+    gap_thresh = median_h * 1.5
+
+    row_cells = []  # list of rows; each row: list of (text, left, right)
+    for ln in lines:
+        cells = []
+        cur_text = cur_l = cur_r = None
+        for t, c, b in ln:
+            l, top, r, bot = b
+            if cur_text is None:
+                cur_text, cur_l, cur_r = t, l, r
+            elif l - cur_r > gap_thresh:
+                cells.append((cur_text, cur_l, cur_r))
+                cur_text, cur_l, cur_r = t, l, r
+            else:
+                cur_text = f"{cur_text} {t}"
+                cur_r = max(cur_r, r)
+        if cur_text is not None:
+            cells.append((cur_text, cur_l, cur_r))
+        row_cells.append(cells)
+
+    # Cluster cell x-centers across all rows into shared column positions —
+    # sorted centers that are close together (within col_tol) collapse into
+    # one column, so a value in row 3 lands in the same column as a value in
+    # row 7 even if the individual word boxes aren't pixel-aligned.
+    col_tol = median_h * 2.5
+    centers = sorted((l + r) / 2 for row in row_cells for (_, l, r) in row)
+    clusters: list[list[float]] = []
+    for c in centers:
+        if clusters and c - (sum(clusters[-1]) / len(clusters[-1])) <= col_tol:
+            clusters[-1].append(c)
+        else:
+            clusters.append([c])
+    col_centers = [sum(cl) / len(cl) for cl in clusters]
+    if not col_centers:
+        return []
+
+    def nearest_col(c: float) -> int:
+        return min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - c))
+
+    grid: list[list[str]] = []
+    for row in row_cells:
+        out_row = [""] * len(col_centers)
+        for text, l, r in row:
+            idx = nearest_col((l + r) / 2)
+            out_row[idx] = f"{out_row[idx]} {text}".strip() if out_row[idx] else text
+        grid.append(out_row)
+    return grid
+
+
+def table_to_csv(grid: list[list[str]]) -> str:
+    import csv
+    import io
+
+    buf = io.StringIO()
+    csv.writer(buf).writerows(grid)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
@@ -663,6 +742,7 @@ class PageResult:
     image_height: int = 0
     diagnostics: list = field(default_factory=list)
     region_count: int = 1
+    table: list = field(default_factory=list)  # list[list[str]] — reconstructed rows/columns
 
 
 def run_pipeline(rgb: np.ndarray, skip_perspective: bool = False) -> PageResult:
@@ -717,4 +797,5 @@ def run_pipeline(rgb: np.ndarray, skip_perspective: bool = False) -> PageResult:
         image_height=prepared.color.shape[0],
         diagnostics=notes,
         region_count=max(1, len(regions)),
+        table=build_table(boxes) if boxes else [],
     )

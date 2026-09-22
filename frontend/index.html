@@ -115,6 +115,16 @@
   .img-wrap img{ max-width:100%; border-radius:10px; box-shadow:var(--shadow); }
   .copy-row{ display:flex; justify-content:flex-end; gap:8px; margin-bottom:10px; }
   .copy-row button{ padding:7px 14px; font-size:0.82rem; }
+  .table-wrap{ overflow:auto; max-height:520px; border-radius:10px; }
+  table.extracted-table{ border-collapse:collapse; width:100%; font-size:0.85rem; }
+  table.extracted-table td{
+    border:1px solid var(--outline); padding:6px 10px; white-space:nowrap;
+    background:var(--surface); vertical-align:top;
+  }
+  table.extracted-table tr:nth-child(even) td{ background:var(--surface-alt); }
+  .downloads-bar{
+    display:flex; justify-content:flex-end; gap:8px; margin-bottom:14px; flex-wrap:wrap;
+  }
   .diag{ font-size:0.8rem; color:var(--on-surface-variant); padding: 0 18px 16px; }
   .diag div{ padding:2px 0; }
   #error{
@@ -272,7 +282,7 @@ function pollJob(jobId) {
 
       // Show pages as they complete rather than waiting for the whole job.
       if (data.pages && data.pages.length) {
-        renderResults(data, data.status !== 'done');
+        renderResults(data, data.status !== 'done', jobId);
       }
 
       if (data.status === 'done') {
@@ -294,9 +304,25 @@ function pollJob(jobId) {
   });
 }
 
-function renderResults(data, stillProcessing) {
+function renderResults(data, stillProcessing, jobId) {
   resultsEl.innerHTML = '';
   const totalLabel = data.total_pages > 1 || data.pages.length > 1;
+
+  if (!stillProcessing && jobId) {
+    const bar = document.createElement('div');
+    bar.className = 'downloads-bar';
+    const csvBtn = document.createElement('button');
+    csvBtn.className = 'secondary';
+    csvBtn.textContent = 'Download CSV';
+    csvBtn.onclick = () => { window.location.href = '/api/scan/' + jobId + '/csv'; };
+    const xlsxBtn = document.createElement('button');
+    xlsxBtn.textContent = 'Download Excel';
+    xlsxBtn.onclick = () => { window.location.href = '/api/scan/' + jobId + '/xlsx'; };
+    bar.appendChild(csvBtn);
+    bar.appendChild(xlsxBtn);
+    resultsEl.appendChild(bar);
+  }
+
   data.pages.forEach((page, i) => {
     const card = document.createElement('div');
     card.className = 'page-card';
@@ -313,6 +339,7 @@ function renderResults(data, stillProcessing) {
     tabs.className = 'tabs';
     tabs.innerHTML = `
       <div class="tab active" data-tab="text">Text</div>
+      <div class="tab" data-tab="table">Table</div>
       <div class="tab" data-tab="image">Image</div>
     `;
     card.appendChild(tabs);
@@ -338,6 +365,42 @@ function renderResults(data, stillProcessing) {
     textBody.appendChild(pre);
     card.appendChild(textBody);
 
+    const tableBody = document.createElement('div');
+    tableBody.className = 'tab-body hidden';
+    if (page.table && page.table.length) {
+      const copyRow2 = document.createElement('div');
+      copyRow2.className = 'copy-row';
+      const copyCsvBtn = document.createElement('button');
+      copyCsvBtn.className = 'secondary';
+      copyCsvBtn.textContent = 'Copy as CSV';
+      copyCsvBtn.onclick = () => {
+        navigator.clipboard.writeText(rowsToCsv(page.table));
+        copyCsvBtn.textContent = 'Copied!';
+        setTimeout(() => copyCsvBtn.textContent = 'Copy as CSV', 1200);
+      };
+      copyRow2.appendChild(copyCsvBtn);
+      tableBody.appendChild(copyRow2);
+
+      const wrap = document.createElement('div');
+      wrap.className = 'table-wrap';
+      const table = document.createElement('table');
+      table.className = 'extracted-table';
+      page.table.forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach(cell => {
+          const td = document.createElement('td');
+          td.textContent = cell;
+          tr.appendChild(td);
+        });
+        table.appendChild(tr);
+      });
+      wrap.appendChild(table);
+      tableBody.appendChild(wrap);
+    } else {
+      tableBody.innerHTML = '<div style="color:var(--on-surface-variant);font-size:0.9rem;">No tabular structure detected on this page.</div>';
+    }
+    card.appendChild(tableBody);
+
     const imgBody = document.createElement('div');
     imgBody.className = 'tab-body hidden';
     imgBody.innerHTML = `<div class="img-wrap"><img src="${page.image}" alt="Processed page image"/></div>`;
@@ -355,6 +418,7 @@ function renderResults(data, stillProcessing) {
         tabs.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
         t.classList.add('active');
         textBody.classList.toggle('hidden', t.dataset.tab !== 'text');
+        tableBody.classList.toggle('hidden', t.dataset.tab !== 'table');
         imgBody.classList.toggle('hidden', t.dataset.tab !== 'image');
       });
     });
@@ -377,6 +441,13 @@ function downloadText(text, filename) {
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+function rowsToCsv(rows) {
+  return rows.map(row => row.map(cell => {
+    const s = String(cell ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\r\n');
 }
 
 function escapeHtml(s) {
