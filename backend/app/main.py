@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import io
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,7 +29,26 @@ from . import ocr_engine
 APP_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = APP_DIR.parent.parent / "frontend"
 
+print("DocOCR Web starting…", flush=True)
+
 app = FastAPI(title="DocOCR Web")
+
+
+@app.on_event("startup")
+def _warm_models_in_background() -> None:
+    """Binds the port immediately; the (small, but non-zero) ONNX model load
+    happens in a background thread so a slow host never delays health checks."""
+
+    def _run():
+        try:
+            ocr_engine.preload_models()
+            print("OCR models loaded.", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"Model preload failed (will retry lazily per-request): {e}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

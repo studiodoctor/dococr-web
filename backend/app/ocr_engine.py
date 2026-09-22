@@ -52,12 +52,50 @@ MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 _providers = ["CPUExecutionProvider"]
-_det_sess = ort.InferenceSession(str(MODELS_DIR / "det.onnx"), providers=_providers)
-_rec_sess = ort.InferenceSession(str(MODELS_DIR / "rec.onnx"), providers=_providers)
-_cls_sess = ort.InferenceSession(str(MODELS_DIR / "cls.onnx"), providers=_providers)
 _DICT = [ln.rstrip("\n") for ln in open(MODELS_DIR / "rec_dict.txt", encoding="utf-8")]
 
 TESSDATA_DIR = str(MODELS_DIR)
+
+# Sessions are created lazily (on first use, not at import) and pinned to a
+# single thread. This keeps the process' startup fast and its memory/CPU
+# footprint predictable on small/free hosting tiers (e.g. Render's free
+# instance) — the port binds and /api/health responds immediately, instead of
+# the whole request potentially blocking on model loads before the server is
+# even listening.
+_sessions: dict[str, ort.InferenceSession] = {}
+
+
+def _session(name: str) -> ort.InferenceSession:
+    sess = _sessions.get(name)
+    if sess is None:
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        sess = ort.InferenceSession(str(MODELS_DIR / name), sess_options=opts, providers=_providers)
+        _sessions[name] = sess
+    return sess
+
+
+def _det_sess() -> ort.InferenceSession:
+    return _session("det.onnx")
+
+
+def _rec_sess() -> ort.InferenceSession:
+    return _session("rec.onnx")
+
+
+def _cls_sess() -> ort.InferenceSession:
+    return _session("cls.onnx")
+
+
+def preload_models() -> None:
+    """Warms up all three sessions. Called once from a background thread on
+    app startup so the first real request isn't the one paying for it, while
+    still letting uvicorn bind the port and answer /api/health immediately."""
+    _det_sess()
+    _rec_sess()
+    _cls_sess()
 
 
 def _order_clockwise(pts):
@@ -79,7 +117,8 @@ def _detect(rgb: np.ndarray):
     x = (x - MEAN) / STD
     x = x.transpose(2, 0, 1)[None]
 
-    prob = _det_sess.run(None, {_det_sess.get_inputs()[0].name: x})[0][0][0]
+    det_sess = _det_sess()
+    prob = det_sess.run(None, {det_sess.get_inputs()[0].name: x})[0][0][0]
     _, binmap = cv2.threshold(prob, DET_THRESH, 255.0, cv2.THRESH_BINARY)
     binmap = binmap.astype(np.uint8)
     contours, _ = cv2.findContours(binmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -146,7 +185,8 @@ def _recognise_crop(crop: np.ndarray):
     x = resized.astype(np.float32) / 255.0
     x = (x - 0.5) / 0.5
     x = x.transpose(2, 0, 1)[None]
-    logits = _rec_sess.run(None, {_rec_sess.get_inputs()[0].name: x})[0][0]
+    rec_sess = _rec_sess()
+    logits = rec_sess.run(None, {rec_sess.get_inputs()[0].name: x})[0][0]
     return _ctc_decode(logits)
 
 
@@ -163,7 +203,8 @@ def _classify_180(crops):
         r = (r - 0.5) / 0.5
         pad = np.zeros((3, CLS_HEIGHT, CLS_WIDTH), np.float32)
         pad[:, :, :rw] = r
-        p = _cls_sess.run(None, {_cls_sess.get_inputs()[0].name: pad[None]})[0][0]
+        cls_sess = _cls_sess()
+        p = cls_sess.run(None, {cls_sess.get_inputs()[0].name: pad[None]})[0][0]
         out.append(bool(p[1] > CLS_THRESH))
     return out
 
