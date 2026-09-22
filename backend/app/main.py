@@ -8,6 +8,7 @@ extracted text with layout preserved, per page.
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import sys
 import threading
@@ -56,8 +57,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_SIDE = 2600  # matches ImageLoader.MAX_SIDE on Android
-PDF_RENDER_DPI = 220
+# Render's free tier caps a container at 512MB RAM. Measured peak memory for
+# one page through the full pipeline (preprocessing + Tesseract + PaddleOCR,
+# Tesseract's own subprocess included) is ~415MB at MAX_SIDE=1600 vs. ~577MB
+# (already over the limit) at the original 2600 — this size was chosen from
+# that measurement, not guessed. Accuracy at 1600 was unchanged in testing.
+# If you're running this somewhere with more RAM, both can be raised again —
+# 2600/220 matches what the Android app uses.
+MAX_SIDE = 1600
+PDF_RENDER_DPI = 170
 MAX_PAGES = 20
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 
@@ -180,6 +188,10 @@ async def scan(file: UploadFile = File(...)):
                 image=_encode_png(rgb),
             )
         )
+        # Free this page's intermediate arrays before starting the next one —
+        # matters on a memory-capped host (e.g. Render free tier) with a
+        # multi-page PDF, where pages would otherwise be able to pile up.
+        gc.collect()
 
     return ScanResult(
         filename=file.filename or "upload",
