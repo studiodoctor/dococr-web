@@ -1,9 +1,16 @@
 """
 DocOCR Web — FastAPI backend.
 
-POST /api/scan accepts a PDF or image upload, runs every page through the
-same OCR pipeline used by the Android app (see ocr_engine.py), and returns
-extracted text with layout preserved, per page.
+Large documents (many pages, or just slow on a constrained host) are handled
+as a background JOB rather than one long synchronous request: POST /api/scan
+returns a job_id immediately, pages are OCR'd one at a time in a background
+thread, and the frontend polls GET /api/scan/{job_id} for progress and
+results as each page finishes. This matters specifically on a memory-and-CPU
+capped free host (Render's free tier: 512MB RAM, throttled CPU) — a
+synchronous multi-page request there can run long enough to hit the
+platform's own proxy timeout, which looks identical to a memory crash (a
+502) from the outside. Keeping every HTTP request short avoids that
+regardless of how long the whole document takes to finish.
 """
 from __future__ import annotations
 
@@ -13,14 +20,16 @@ import io
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import fitz  # PyMuPDF
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -57,17 +66,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Render's free tier caps a container at 512MB RAM. Measured peak memory for
-# one page through the full pipeline (preprocessing + Tesseract + PaddleOCR,
-# Tesseract's own subprocess included) is ~415MB at MAX_SIDE=1600 vs. ~577MB
-# (already over the limit) at the original 2600 — this size was chosen from
-# that measurement, not guessed. Accuracy at 1600 was unchanged in testing.
-# If you're running this somewhere with more RAM, both can be raised again —
-# 2600/220 matches what the Android app uses.
+# The Android app (and this app's own full-quality default) uses 2600/220,
+# but a 512MB-RAM host — Render's free tier — can't fit a page that large
+# through the full pipeline (measured peak ~577MB, over the limit). These are
+# lowered to 1600/170, measured safe at ~415-450MB with no accuracy loss on
+# clean documents (dense small print can still be imperfect regardless of
+# this setting — that's a separate OCR-quality issue, not memory). If you
+# ever move to a host with more RAM, raise both back to 2600/220.
 MAX_SIDE = 1600
 PDF_RENDER_DPI = 170
-MAX_PAGES = 20
+MAX_PAGES = 40
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+
+# How long a finished/failed job's result stays in memory before being
+# swept — the frontend polls until done, so this is just a safety net
+# against a growing job dict if a browser tab is abandoned mid-scan.
+JOB_TTL_SECONDS = 30 * 60
 
 
 def _cap_size(rgb: np.ndarray) -> np.ndarray:
@@ -83,11 +97,20 @@ def _pil_to_rgb(im: Image.Image) -> np.ndarray:
     return np.array(im)
 
 
+def _exif_transpose(im: Image.Image) -> Image.Image:
+    try:
+        from PIL import ImageOps
+        return ImageOps.exif_transpose(im) or im
+    except Exception:  # noqa: BLE001
+        return im
+
+
 def _load_pages(filename: str, data: bytes) -> list[np.ndarray]:
     lower = filename.lower()
     if lower.endswith(".pdf"):
         doc = fitz.open(stream=data, filetype="pdf")
         if doc.page_count > MAX_PAGES:
+            doc.close()
             raise HTTPException(400, f"PDF has {doc.page_count} pages; the limit is {MAX_PAGES}.")
         pages = []
         zoom = PDF_RENDER_DPI / 72.0
@@ -106,14 +129,6 @@ def _load_pages(filename: str, data: bytes) -> list[np.ndarray]:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"Could not read the image ({type(e).__name__}).") from e
     return [_cap_size(_pil_to_rgb(im))]
-
-
-def _exif_transpose(im: Image.Image) -> Image.Image:
-    try:
-        from PIL import ImageOps
-        return ImageOps.exif_transpose(im) or im
-    except Exception:  # noqa: BLE001
-        return im
 
 
 def _encode_png(rgb: np.ndarray) -> str:
@@ -143,38 +158,71 @@ class PageOut(BaseModel):
     image: str
 
 
-class ScanResult(BaseModel):
+class JobStatus(BaseModel):
+    job_id: str
+    status: Literal["queued", "processing", "done", "error"]
     filename: str
+    total_pages: int
+    completed_pages: int
     pages: list[PageOut]
     elapsed_seconds: float
     engines_available: str
+    error: str | None = None
 
 
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "tesseract": True,
-        "paddleocr": True,
-    }
+@dataclass
+class _Job:
+    job_id: str
+    filename: str
+    status: Literal["queued", "processing", "done", "error"] = "queued"
+    total_pages: int = 0
+    pages: list[PageOut] = field(default_factory=list)
+    error: str | None = None
+    started: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def to_status(self) -> JobStatus:
+        with self.lock:
+            elapsed = (self.finished_at or time.time()) - self.started
+            return JobStatus(
+                job_id=self.job_id,
+                status=self.status,
+                filename=self.filename,
+                total_pages=self.total_pages,
+                completed_pages=len(self.pages),
+                pages=list(self.pages),
+                elapsed_seconds=round(elapsed, 2),
+                engines_available="Tesseract + PaddleOCR",
+                error=self.error,
+            )
 
 
-@app.post("/api/scan", response_model=ScanResult)
-async def scan(file: UploadFile = File(...)):
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(400, "File is too large (30 MB limit).")
-    if not data:
-        raise HTTPException(400, "Uploaded file is empty.")
+_jobs: dict[str, _Job] = {}
+_jobs_lock = threading.Lock()
 
-    started = time.time()
-    pages = _load_pages(file.filename or "upload", data)
 
-    out_pages: list[PageOut] = []
-    for i, rgb in enumerate(pages):
-        result = ocr_engine.run_pipeline(rgb)
-        out_pages.append(
-            PageOut(
+def _sweep_old_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with _jobs_lock:
+        stale = [
+            jid for jid, j in _jobs.items()
+            if j.finished_at is not None and j.finished_at < cutoff
+        ]
+        for jid in stale:
+            del _jobs[jid]
+
+
+def _run_job(job: _Job, filename: str, data: bytes) -> None:
+    try:
+        pages = _load_pages(filename, data)
+        with job.lock:
+            job.total_pages = len(pages)
+            job.status = "processing"
+
+        for i, rgb in enumerate(pages):
+            result = ocr_engine.run_pipeline(rgb)
+            page_out = PageOut(
                 index=i,
                 text=result.plain_text,
                 engine=result.chosen_engine,
@@ -187,18 +235,69 @@ async def scan(file: UploadFile = File(...)):
                 ],
                 image=_encode_png(rgb),
             )
-        )
-        # Free this page's intermediate arrays before starting the next one —
-        # matters on a memory-capped host (e.g. Render free tier) with a
-        # multi-page PDF, where pages would otherwise be able to pile up.
-        gc.collect()
+            with job.lock:
+                job.pages.append(page_out)
+            # Free this page's intermediate arrays before starting the next
+            # one — matters on a memory-capped host with a multi-page PDF,
+            # where pages would otherwise be able to pile up.
+            del result, rgb
+            gc.collect()
 
-    return ScanResult(
-        filename=file.filename or "upload",
-        pages=out_pages,
-        elapsed_seconds=round(time.time() - started, 2),
-        engines_available="Tesseract + PaddleOCR",
-    )
+        with job.lock:
+            job.status = "done"
+            job.finished_at = time.time()
+    except HTTPException as e:
+        with job.lock:
+            job.status = "error"
+            job.error = str(e.detail)
+            job.finished_at = time.time()
+    except Exception as e:  # noqa: BLE001
+        print(f"Job {job.job_id} failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        with job.lock:
+            job.status = "error"
+            job.error = f"{type(e).__name__}: {e}"
+            job.finished_at = time.time()
+    finally:
+        _sweep_old_jobs()
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "tesseract": True,
+        "paddleocr": True,
+    }
+
+
+@app.post("/api/scan", response_model=JobStatus)
+async def scan(file: UploadFile = File(...)):
+    """Starts a scan job and returns immediately (status: queued/processing) —
+    poll GET /api/scan/{job_id} for progress and the finished result. This
+    never blocks on OCR itself, so large documents can't time out a single
+    HTTP request even on a slow host."""
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "File is too large (30 MB limit).")
+    if not data:
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    filename = file.filename or "upload"
+    job = _Job(job_id=uuid.uuid4().hex, filename=filename)
+    with _jobs_lock:
+        _jobs[job.job_id] = job
+
+    threading.Thread(target=_run_job, args=(job, filename, data), daemon=True).start()
+    return job.to_status()
+
+
+@app.get("/api/scan/{job_id}", response_model=JobStatus)
+def scan_status(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired job.")
+    return job.to_status()
 
 
 # Serve the frontend as static files, with index.html at the root.

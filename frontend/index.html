@@ -214,13 +214,16 @@ function formatSize(n) {
   return (n/1024/1024).toFixed(1) + ' MB';
 }
 
+let pollTimer = null;
+
 scanBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
   resultsEl.style.display = 'none';
   errorEl.style.display = 'none';
   statusEl.style.display = 'block';
   scanBtn.disabled = true;
-  statusText.textContent = 'Reading your document…';
+  statusText.textContent = 'Uploading your document…';
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 
   try {
     const form = new FormData();
@@ -230,19 +233,70 @@ scanBtn.addEventListener('click', async () => {
       const detail = await resp.json().catch(() => ({}));
       throw new Error(detail.detail || ('Server error ' + resp.status));
     }
-    const data = await resp.json();
-    renderResults(data);
+    const job = await resp.json();
+    await pollJob(job.job_id);
   } catch (err) {
     errorEl.textContent = 'Could not scan the document — ' + err.message;
     errorEl.style.display = 'block';
-  } finally {
     statusEl.style.display = 'none';
     scanBtn.disabled = false;
   }
 });
 
-function renderResults(data) {
+// Large or multi-page documents are processed as a background job, so a
+// single slow request never sits open long enough to time out — poll for
+// progress instead, and render each page as it finishes.
+function pollJob(jobId) {
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      let data;
+      try {
+        const resp = await fetch('/api/scan/' + jobId);
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => ({}));
+          throw new Error(detail.detail || ('Server error ' + resp.status));
+        }
+        data = await resp.json();
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      if (data.total_pages > 0) {
+        statusText.textContent = data.completed_pages < data.total_pages
+          ? `Reading page ${data.completed_pages + 1} of ${data.total_pages}…`
+          : 'Finishing up…';
+      } else {
+        statusText.textContent = 'Reading your document…';
+      }
+
+      // Show pages as they complete rather than waiting for the whole job.
+      if (data.pages && data.pages.length) {
+        renderResults(data, data.status !== 'done');
+      }
+
+      if (data.status === 'done') {
+        statusEl.style.display = 'none';
+        scanBtn.disabled = false;
+        resolve();
+      } else if (data.status === 'error') {
+        reject(new Error(data.error || 'The scan failed.'));
+      } else {
+        pollTimer = setTimeout(tick, 1200);
+      }
+    };
+    tick();
+  }).catch(err => {
+    errorEl.textContent = 'Could not scan the document — ' + err.message;
+    errorEl.style.display = 'block';
+    statusEl.style.display = 'none';
+    scanBtn.disabled = false;
+  });
+}
+
+function renderResults(data, stillProcessing) {
   resultsEl.innerHTML = '';
+  const totalLabel = data.total_pages > 1 || data.pages.length > 1;
   data.pages.forEach((page, i) => {
     const card = document.createElement('div');
     card.className = 'page-card';
@@ -250,8 +304,8 @@ function renderResults(data) {
     const head = document.createElement('div');
     head.className = 'page-head';
     head.innerHTML = `
-      <span class="title">${data.pages.length > 1 ? 'Page ' + (i+1) : data.filename}</span>
-      <span class="badge">${page.engine} · ${page.boxes.length} lines · ${data.elapsed_seconds}s</span>
+      <span class="title">${totalLabel ? 'Page ' + (i+1) + (data.total_pages ? ' of ' + data.total_pages : '') : data.filename}</span>
+      <span class="badge">${page.engine} · ${page.boxes.length} lines</span>
     `;
     card.appendChild(head);
 
@@ -307,6 +361,12 @@ function renderResults(data) {
 
     resultsEl.appendChild(card);
   });
+  if (stillProcessing && data.total_pages > data.pages.length) {
+    const more = document.createElement('div');
+    more.style.cssText = 'text-align:center;color:var(--on-surface-variant);font-size:0.85rem;padding:12px;';
+    more.textContent = `Reading page ${data.pages.length + 1} of ${data.total_pages}…`;
+    resultsEl.appendChild(more);
+  }
   resultsEl.style.display = 'block';
 }
 
