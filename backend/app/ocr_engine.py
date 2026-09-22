@@ -382,7 +382,11 @@ def preprocess(rgb: np.ndarray, skip_perspective: bool = False) -> Prepared:
     clean = enhance(warped)
     gray = cv2.cvtColor(clean, cv2.COLOR_RGB2GRAY)
     binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12)
-    return Prepared(clean, cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB), corrected, ang)
+    # Kept single-channel (not expanded to RGB) — it's a pure black/white image
+    # so the two extra channels were pure waste, and Tesseract (the only
+    # consumer) accepts grayscale directly. Cuts a meaningful chunk of peak
+    # memory on memory-capped hosts for free.
+    return Prepared(clean, binary, corrected, ang)
 
 
 def rotate_prepared(p: Prepared, degrees: int) -> Prepared:
