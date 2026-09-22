@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pymupdf==1.28.2
+opencv-contrib-python-headless==4.10.0.84
+onnxruntime==1.19.2
+numpy==2.3.5
+pillow==11.0.0
+pytesseract==0.3.13
+pydantic==2.10.6

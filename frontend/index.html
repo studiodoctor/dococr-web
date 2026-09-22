@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DocOCR — Scan documents to text</title>
+<style>
+  :root{
+    --primary:#00696E; --primary-dark:#004D51;
+    --bg:#FAF9F6; --surface:#FFFFFF; --surface-alt:#F1EFEA;
+    --on-bg:#1B1C1C; --on-surface-variant:#49454A;
+    --outline:#DCD9D3; --tertiary:#B0501E;
+    --success:#2E7D5B;
+    --radius:16px;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --primary:#4FD8DF; --primary-dark:#8CEBEF;
+      --bg:#101312; --surface:#1A1E1D; --surface-alt:#222726;
+      --on-bg:#E4E3DF; --on-surface-variant:#C5C6C0;
+      --outline:#3A3F3D; --tertiary:#FFB68A;
+      --success:#7FDCB0;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.4);
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--on-bg);
+    font-family:'Segoe UI', system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+    padding-inline: max(16px, calc((100vw - 900px)/2));
+    padding-block: 32px 60px;
+  }
+  header{ text-align:center; margin-bottom: 28px; }
+  header .logo{
+    width:56px; height:56px; border-radius:16px; margin:0 auto 14px;
+    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    display:flex; align-items:center; justify-content:center;
+    box-shadow: var(--shadow);
+  }
+  header .logo svg{ width:28px; height:28px; }
+  h1{ font-size: 1.7rem; margin: 0 0 6px; letter-spacing:-0.02em; }
+  header p{ color:var(--on-surface-variant); margin:0; font-size:0.98rem; }
+
+  #dropzone{
+    background:var(--surface); border:2px dashed var(--outline); border-radius:var(--radius);
+    padding: 40px 24px; text-align:center; cursor:pointer; transition: border-color .15s, background .15s;
+    box-shadow: var(--shadow);
+  }
+  #dropzone.drag{ border-color:var(--primary); background: color-mix(in srgb, var(--primary) 8%, var(--surface)); }
+  #dropzone svg{ width:40px; height:40px; color:var(--primary); margin-bottom:10px; }
+  #dropzone strong{ display:block; margin-bottom:4px; }
+  #dropzone span{ color:var(--on-surface-variant); font-size:0.9rem; }
+  #fileInput{ display:none; }
+
+  .chips{ display:flex; gap:8px; justify-content:center; margin-top:14px; flex-wrap:wrap; }
+  .chip{
+    font-size:0.78rem; padding:5px 12px; border-radius:999px; background:var(--surface-alt);
+    color:var(--on-surface-variant); border:1px solid var(--outline);
+  }
+
+  #fileRow{
+    display:none; align-items:center; gap:12px; background:var(--surface); border-radius:var(--radius);
+    padding:14px 18px; margin-top:16px; box-shadow: var(--shadow);
+  }
+  #fileRow .name{ flex:1; font-size:0.92rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #fileRow .size{ color:var(--on-surface-variant); font-size:0.82rem; }
+  button{
+    font: inherit; cursor:pointer; border:none; border-radius:12px; padding:11px 22px;
+    background:var(--primary); color:#fff; font-weight:600; font-size:0.92rem;
+    transition: filter .15s, transform .1s;
+  }
+  button:hover{ filter:brightness(1.06); }
+  button:active{ transform: scale(0.98); }
+  button.secondary{ background:transparent; color:var(--primary); border:1.5px solid var(--outline); }
+  button:disabled{ opacity:.5; cursor:not-allowed; }
+  #scanBtnRow{ text-align:center; margin-top:18px; }
+
+  #status{ text-align:center; margin-top:22px; color:var(--on-surface-variant); display:none; }
+  .spinner{
+    width:34px; height:34px; border-radius:50%; margin: 0 auto 12px;
+    border: 3px solid var(--outline); border-top-color: var(--primary);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin{ to{ transform: rotate(360deg); } }
+
+  #results{ display:none; margin-top:28px; }
+  .page-card{
+    background:var(--surface); border-radius:var(--radius); box-shadow:var(--shadow);
+    margin-bottom:22px; overflow:hidden;
+  }
+  .page-head{
+    display:flex; align-items:center; justify-content:space-between; padding:14px 18px;
+    border-bottom:1px solid var(--outline); flex-wrap:wrap; gap:8px;
+  }
+  .page-head .title{ font-weight:600; }
+  .badge{
+    font-size:0.75rem; padding:4px 10px; border-radius:999px;
+    background: color-mix(in srgb, var(--primary) 14%, transparent); color:var(--primary); font-weight:600;
+  }
+  .tabs{ display:flex; gap:4px; padding: 10px 18px 0; }
+  .tab{
+    padding:8px 14px; border-radius:10px 10px 0 0; font-size:0.86rem; cursor:pointer;
+    color:var(--on-surface-variant); font-weight:600;
+  }
+  .tab.active{ background:var(--surface-alt); color:var(--primary); }
+  .tab-body{ padding:18px; }
+  .tab-body.hidden{ display:none; }
+  pre.extracted{
+    white-space:pre-wrap; word-break:break-word; font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size:0.88rem; line-height:1.55; margin:0; max-height:520px; overflow:auto;
+    background:var(--surface-alt); border-radius:10px; padding:14px;
+  }
+  .img-wrap{ text-align:center; }
+  .img-wrap img{ max-width:100%; border-radius:10px; box-shadow:var(--shadow); }
+  .copy-row{ display:flex; justify-content:flex-end; gap:8px; margin-bottom:10px; }
+  .copy-row button{ padding:7px 14px; font-size:0.82rem; }
+  .diag{ font-size:0.8rem; color:var(--on-surface-variant); padding: 0 18px 16px; }
+  .diag div{ padding:2px 0; }
+  #error{
+    display:none; background: color-mix(in srgb, var(--tertiary) 12%, var(--surface));
+    border:1px solid var(--tertiary); color:var(--tertiary); border-radius:12px; padding:14px 18px;
+    margin-top:20px; font-size:0.9rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z" stroke="white" stroke-width="1.6"/>
+      <path d="M8 12h8M8 15.5h5.5M8 8.5h4" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
+    </svg>
+  </div>
+  <h1>DocOCR</h1>
+  <p>Upload a photo or PDF — get clean, laid-out text back in seconds.</p>
+</header>
+
+<div id="dropzone">
+  <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M12 16V4m0 0 4 4m-4-4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  </svg>
+  <strong>Drop a document here, or click to choose a file</strong>
+  <span>PDF, JPG, PNG, WEBP — up to 30&nbsp;MB, 20 pages</span>
+  <div class="chips">
+    <span class="chip">Tesseract</span>
+    <span class="chip">PaddleOCR PP-OCRv5</span>
+    <span class="chip">Layout-aware</span>
+    <span class="chip">Runs fully on this server</span>
+  </div>
+</div>
+<input id="fileInput" type="file" accept=".pdf,image/*" />
+
+<div id="fileRow">
+  <span class="name" id="fileName"></span>
+  <span class="size" id="fileSize"></span>
+  <button class="secondary" id="clearBtn" type="button">Remove</button>
+</div>
+
+<div id="scanBtnRow" style="display:none">
+  <button id="scanBtn" type="button">Scan document</button>
+</div>
+
+<div id="status">
+  <div class="spinner"></div>
+  <div id="statusText">Reading your document…</div>
+</div>
+
+<div id="error"></div>
+
+<div id="results"></div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const fileRow = document.getElementById('fileRow');
+const fileName = document.getElementById('fileName');
+const fileSize = document.getElementById('fileSize');
+const clearBtn = document.getElementById('clearBtn');
+const scanBtnRow = document.getElementById('scanBtnRow');
+const scanBtn = document.getElementById('scanBtn');
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const resultsEl = document.getElementById('results');
+const errorEl = document.getElementById('error');
+
+let selectedFile = null;
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) selectFile(fileInput.files[0]); });
+clearBtn.addEventListener('click', () => { selectedFile = null; fileRow.style.display='none'; scanBtnRow.style.display='none'; fileInput.value=''; });
+
+function selectFile(f) {
+  selectedFile = f;
+  fileName.textContent = f.name;
+  fileSize.textContent = formatSize(f.size);
+  fileRow.style.display = 'flex';
+  scanBtnRow.style.display = 'block';
+  resultsEl.style.display = 'none';
+  errorEl.style.display = 'none';
+}
+
+function formatSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(1) + ' MB';
+}
+
+scanBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  resultsEl.style.display = 'none';
+  errorEl.style.display = 'none';
+  statusEl.style.display = 'block';
+  scanBtn.disabled = true;
+  statusText.textContent = 'Reading your document…';
+
+  try {
+    const form = new FormData();
+    form.append('file', selectedFile);
+    const resp = await fetch('/api/scan', { method: 'POST', body: form });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || ('Server error ' + resp.status));
+    }
+    const data = await resp.json();
+    renderResults(data);
+  } catch (err) {
+    errorEl.textContent = 'Could not scan the document — ' + err.message;
+    errorEl.style.display = 'block';
+  } finally {
+    statusEl.style.display = 'none';
+    scanBtn.disabled = false;
+  }
+});
+
+function renderResults(data) {
+  resultsEl.innerHTML = '';
+  data.pages.forEach((page, i) => {
+    const card = document.createElement('div');
+    card.className = 'page-card';
+
+    const head = document.createElement('div');
+    head.className = 'page-head';
+    head.innerHTML = `
+      <span class="title">${data.pages.length > 1 ? 'Page ' + (i+1) : data.filename}</span>
+      <span class="badge">${page.engine} · ${page.boxes.length} lines · ${data.elapsed_seconds}s</span>
+    `;
+    card.appendChild(head);
+
+    const tabs = document.createElement('div');
+    tabs.className = 'tabs';
+    tabs.innerHTML = `
+      <div class="tab active" data-tab="text">Text</div>
+      <div class="tab" data-tab="image">Image</div>
+    `;
+    card.appendChild(tabs);
+
+    const textBody = document.createElement('div');
+    textBody.className = 'tab-body';
+    const copyRow = document.createElement('div');
+    copyRow.className = 'copy-row';
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'secondary';
+    copyBtn.textContent = 'Copy text';
+    copyBtn.onclick = () => { navigator.clipboard.writeText(page.text); copyBtn.textContent = 'Copied!'; setTimeout(()=>copyBtn.textContent='Copy text', 1200); };
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'secondary';
+    dlBtn.textContent = 'Download .txt';
+    dlBtn.onclick = () => downloadText(page.text, (data.filename.replace(/\.[^.]+$/, '') || 'document') + (data.pages.length>1 ? '_page'+(i+1) : '') + '.txt');
+    copyRow.appendChild(copyBtn);
+    copyRow.appendChild(dlBtn);
+    textBody.appendChild(copyRow);
+    const pre = document.createElement('pre');
+    pre.className = 'extracted';
+    pre.textContent = page.text || '(No text detected on this page.)';
+    textBody.appendChild(pre);
+    card.appendChild(textBody);
+
+    const imgBody = document.createElement('div');
+    imgBody.className = 'tab-body hidden';
+    imgBody.innerHTML = `<div class="img-wrap"><img src="${page.image}" alt="Processed page image"/></div>`;
+    card.appendChild(imgBody);
+
+    if (page.diagnostics && page.diagnostics.length) {
+      const diag = document.createElement('div');
+      diag.className = 'diag';
+      diag.innerHTML = page.diagnostics.map(d => `<div>ℹ️ ${escapeHtml(d)}</div>`).join('');
+      card.appendChild(diag);
+    }
+
+    tabs.querySelectorAll('.tab').forEach(t => {
+      t.addEventListener('click', () => {
+        tabs.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        textBody.classList.toggle('hidden', t.dataset.tab !== 'text');
+        imgBody.classList.toggle('hidden', t.dataset.tab !== 'image');
+      });
+    });
+
+    resultsEl.appendChild(card);
+  });
+  resultsEl.style.display = 'block';
+}
+
+function downloadText(text, filename) {
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+</body>
+</html>
